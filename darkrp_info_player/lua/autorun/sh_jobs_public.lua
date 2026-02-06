@@ -7,7 +7,9 @@ local CONFIG = {
     fadeDistance = 100,
     fontName = "DarkRPHUD2",
     fontSize = 23,
-    updateRate = "66"
+    headOffset = 10,
+    screenYOffset = -50,
+    lineSpacing = 20
 }
 
 local PROFESSIONS = {
@@ -56,28 +58,10 @@ local RANDOM_PROFESSIONS = {
 }
 
 -- ============================================================
--- Client initialization
--- ============================================================
-
-if CLIENT then
-    RunConsoleCommand("cl_updaterate", CONFIG.updateRate)
-
-    surface.CreateFont(CONFIG.fontName, {
-        font = "Roboto",
-        size = CONFIG.fontSize,
-        weight = 400,
-        antialias = true,
-        shadow = false,
-        extended = true
-    })
-end
-
--- ============================================================
 -- Data structures
 -- ============================================================
 
 local playerModelMap = {}
-local playerDataCache = {}
 
 for profession, data in pairs(PROFESSIONS) do
     for _, model in ipairs(data.models) do
@@ -89,11 +73,31 @@ for profession, data in pairs(PROFESSIONS) do
 end
 
 -- ============================================================
+-- Client initialization
+-- ============================================================
+
+if CLIENT then
+    surface.CreateFont(CONFIG.fontName, {
+        font = "Roboto",
+        size = CONFIG.fontSize,
+        weight = 400,
+        antialias = true,
+        shadow = false,
+        extended = true
+    })
+end
+
+-- ============================================================
 -- Server-side profession management
 -- ============================================================
 
 if SERVER then
     local function assignRandomProfession(ply)
+        if not IsValid(ply) then return end
+
+        local model = ply:GetModel()
+        if playerModelMap[model] then return end
+
         if ply:GetNWString("RandomProfession", "") == "" then
             local profession = RANDOM_PROFESSIONS[math.random(#RANDOM_PROFESSIONS)]
             local color = Color(math.random(0, 255), math.random(0, 255), math.random(0, 255))
@@ -112,28 +116,18 @@ if SERVER then
         ply:SetNWInt("RandomColorB", 0)
     end
 
-    hook.Add("PlayerInitialSpawn", "RPI_AssignProfession", function(ply)
-        assignRandomProfession(ply)
-    end)
+    hook.Add("PlayerInitialSpawn", "RPI_AssignProfessionInitial", assignRandomProfession)
 
-    hook.Add("PlayerSpawn", "RPI_AssignProfession", function(ply)
-        assignRandomProfession(ply)
-    end)
+    hook.Add("PlayerSpawn", "RPI_AssignProfessionSpawn", assignRandomProfession)
 
     hook.Add("PlayerSetModel", "RPI_ReassignProfession", function(ply)
         clearProfessionData(ply)
-        timer.Simple(0.1, function()
-            if IsValid(ply) then
-                assignRandomProfession(ply)
-            end
-        end)
+        assignRandomProfession(ply)
     end)
 
-    timer.Simple(1, function()
+    hook.Add("Initialize", "RPI_InitExistingPlayers", function()
         for _, ply in ipairs(player.GetAll()) do
-            if IsValid(ply) then
-                assignRandomProfession(ply)
-            end
+            assignRandomProfession(ply)
         end
     end)
 end
@@ -143,79 +137,56 @@ end
 -- ============================================================
 
 if CLIENT then
+    local playerDataCache = {}
+
+    -- Pre-allocated reusable objects to avoid per-frame allocations
+    local shadowColor = Color(0, 0, 0, 255)
+    local tempColor = Color(0, 0, 0, 255)
+    local whiteColor = Color(255, 255, 255, 255)
+    local traceData = {start = Vector(), endpos = Vector(), filter = {}}
+
     local function drawShadowedText(text, font, x, y, color, alignX, alignY)
-        draw.DrawText(text, font, x + 1, y + 1, Color(0, 0, 0, color.a), alignX, alignY)
-        draw.DrawText(text, font, x, y, color, alignX, alignY)
-    end
-
-    local function clearCacheIfModelChanged(ply)
-        local currentModel = ply:GetModel()
-        local cachedModel = playerDataCache[ply] and playerDataCache[ply].model
-
-        if cachedModel and cachedModel ~= currentModel then
-            playerDataCache[ply] = nil
-        end
+        shadowColor.a = color.a
+        draw.SimpleText(text, font, x + 1, y + 1, shadowColor, alignX, alignY)
+        draw.SimpleText(text, font, x, y, color, alignX, alignY)
     end
 
     local function getPlayerInfo(ply)
         local model = ply:GetModel()
         local info = playerModelMap[model]
 
-        if not info then
-            local profession = ply:GetNWString("RandomProfession", "")
-            if profession == "" then return nil end
-
-            if not playerDataCache[ply] or playerDataCache[ply].model ~= model then
-                playerDataCache[ply] = {
-                    team = profession,
-                    color = Color(
-                        ply:GetNWInt("RandomColorR", 255),
-                        ply:GetNWInt("RandomColorG", 255),
-                        ply:GetNWInt("RandomColorB", 255)
-                    ),
-                    model = model
-                }
-            end
-
-            info = playerDataCache[ply]
+        if info then
+            playerDataCache[ply] = nil
+            return info
         end
 
-        return info
+        local profession = ply:GetNWString("RandomProfession", "")
+        if profession == "" then return nil end
+
+        local cached = playerDataCache[ply]
+        if not cached or cached.model ~= model then
+            playerDataCache[ply] = {
+                team = profession,
+                color = Color(
+                    ply:GetNWInt("RandomColorR", 255),
+                    ply:GetNWInt("RandomColorG", 255),
+                    ply:GetNWInt("RandomColorB", 255)
+                ),
+                model = model
+            }
+        end
+
+        return playerDataCache[ply]
     end
 
-    local function shouldDrawPlayer(ply, localPlayer, distance)
-        if not ply:Alive() or ply.buildmode or ply:GetNWBool("isGhost") then
-            return false
-        end
+    local function isVisible(localEyePos, targetPos, localPlayer, ply)
+        traceData.start = localEyePos
+        traceData.endpos = targetPos
+        traceData.filter[1] = localPlayer
+        traceData.filter[2] = ply
 
-        if distance > CONFIG.maxDistance then
-            return false
-        end
-
-        local plyPos = ply:GetPos()
-        local localPos = localPlayer:GetPos()
-
-        local trace = util.TraceLine({
-            start = localPos,
-            endpos = plyPos,
-            filter = {localPlayer, ply}
-        })
-
-        if trace.HitWorld then
-            return false
-        end
-
-        local eyeTrace = util.TraceLine({
-            start = localPlayer:EyePos(),
-            endpos = plyPos,
-            filter = {localPlayer, ply}
-        })
-
-        if eyeTrace.Hit and ply ~= localPlayer then
-            return false
-        end
-
-        return true
+        local trace = util.TraceLine(traceData)
+        return not trace.Hit
     end
 
     local function calculateAlpha(distance)
@@ -225,35 +196,58 @@ if CLIENT then
         return 255
     end
 
+    -- Clean up cache on player disconnect to prevent memory leaks
+    hook.Add("EntityRemoved", "RPI_ClearCache", function(ent)
+        if ent:IsPlayer() then
+            playerDataCache[ent] = nil
+        end
+    end)
+
+    local screenW, screenH = ScrW(), ScrH()
+
+    hook.Add("OnScreenSizeChanged", "RPI_UpdateScreenSize", function()
+        screenW, screenH = ScrW(), ScrH()
+    end)
+
     hook.Add("HUDPaint", "RPI_DrawPlayerInfo", function()
         local localPlayer = LocalPlayer()
-        local screenWidth, screenHeight = ScrW(), ScrH()
+        if not IsValid(localPlayer) then return end
+
+        local localEyePos = localPlayer:EyePos()
 
         for _, ply in ipairs(player.GetAll()) do
-            clearCacheIfModelChanged(ply)
+            if ply == localPlayer then continue end
+            if not IsValid(ply) or not ply:Alive() then continue end
+            if ply.buildmode or ply:GetNWBool("isGhost") then continue end
 
-            local distance = localPlayer:GetPos():Distance(ply:GetPos())
-            if not shouldDrawPlayer(ply, localPlayer, distance) then continue end
+            local plyEyePos = ply:EyePos()
+            local distance = localEyePos:Distance(plyEyePos)
+
+            if distance > CONFIG.maxDistance then continue end
+            if not isVisible(localEyePos, plyEyePos, localPlayer, ply) then continue end
 
             local playerInfo = getPlayerInfo(ply)
             if not playerInfo or not playerInfo.team then continue end
 
-            local pos = ply:EyePos()
-            pos.z = pos.z + 10
+            local pos = plyEyePos + Vector(0, 0, CONFIG.headOffset)
             pos = pos:ToScreen()
-            pos.y = pos.y - 50
+            pos.y = pos.y + CONFIG.screenYOffset
 
-            if pos.x < 0 or pos.y < 0 or pos.x > screenWidth or pos.y > screenHeight then
+            if pos.x < 0 or pos.y < 0 or pos.x > screenW or pos.y > screenH then
                 continue
             end
 
             local alpha = calculateAlpha(distance)
-            local color = Color(playerInfo.color.r, playerInfo.color.g, playerInfo.color.b, alpha)
-            local whiteColor = Color(255, 255, 255, alpha)
 
-            drawShadowedText(ply:Nick(), CONFIG.fontName, pos.x, pos.y, color, TEXT_ALIGN_CENTER)
-            drawShadowedText("Health: " .. math.max(0, ply:Health()), CONFIG.fontName, pos.x, pos.y + 20, whiteColor, TEXT_ALIGN_CENTER)
-            drawShadowedText(playerInfo.team, CONFIG.fontName, pos.x, pos.y + 40, color, TEXT_ALIGN_CENTER)
+            tempColor.r = playerInfo.color.r
+            tempColor.g = playerInfo.color.g
+            tempColor.b = playerInfo.color.b
+            tempColor.a = alpha
+            whiteColor.a = alpha
+
+            drawShadowedText(ply:Nick(), CONFIG.fontName, pos.x, pos.y, tempColor, TEXT_ALIGN_CENTER)
+            drawShadowedText(string.format("Health: %d", math.max(0, ply:Health())), CONFIG.fontName, pos.x, pos.y + CONFIG.lineSpacing, whiteColor, TEXT_ALIGN_CENTER)
+            drawShadowedText(playerInfo.team, CONFIG.fontName, pos.x, pos.y + CONFIG.lineSpacing * 2, tempColor, TEXT_ALIGN_CENTER)
         end
     end)
 end
